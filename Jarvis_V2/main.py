@@ -10,7 +10,7 @@ Conceitos:
 import os
 import sys
 
-from api import epub_import,  chapter_window_map
+from api import epub_import, chapter_window_map, epub_bulk_import
 
 try:
     if os.name == "nt":
@@ -72,3 +72,4 @@ async def health_db():
 app.include_router(epub_import.router)
 
 app.include_router(chapter_window_map.router)  # <-- ADICIONE ESTA LINHA
+app.include_router(epub_bulk_import.router)
