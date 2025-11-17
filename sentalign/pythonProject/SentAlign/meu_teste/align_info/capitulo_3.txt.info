@@ -1,0 +1,10 @@
+File: capitulo_3.txt
+File Elapsed Time: 0:00:21.468600
+Source file length: 90
+Target file length: 123
+Nodes: 11500
+Gale-Church Elapsed Time: 2025-11-17 11:45:34.476220
+Align Elapsed Time: 0:00:21.470117
+Calc Anchors Elapsed Time: 2025-11-17 11:45:34.476220
+Greedy Algorithm Elapsed Time: 2025-11-17 11:45:34.476220
+Anchors: [[90, 123]]
