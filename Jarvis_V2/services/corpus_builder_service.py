@@ -83,8 +83,101 @@ async def _get_full_text_by_href(db: AsyncSession, import_id: int, lang: str, ch
     return txt
 
 
+# --- ARQUIVO ATUALIZADO (O "MOTOR"): services/corpus_builder_service.py ---
+
+import logging
+import os
+import re
+import asyncio
+import subprocess
+import shutil
+import uuid
+import stanza
+from typing import Dict, List, Any, Optional
+import io
+import numpy as np
+
+# --- Importações do Projeto ---
+from db.session import AsyncSessionLocal
+from db.models import TmWinMapping, ChapterText, ChapterIndex, TmAlignedSentences
+from db import models  # <--- ADICIONADO PARA O HELPER DE BUSCA
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy import select, func, update, bindparam, cast, String, distinct  # <-- ADICIONADO 'distinct'
+
+# --- Importações de ML/Processamento ---
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
+
+# --- (Suas constantes SENTALIGN_PYTHON_PATH, SENTALIGN_ROOT_FOLDER, etc. ficam aqui) ---
+SENTALIGN_PYTHON_PATH = r"C:\Users\souno\Desktop\Projects2025\jarvis_v2\sentalign\pythonProject\SentAlign\.venv\Scripts\python.exe"
+SENTALIGN_ROOT_FOLDER = r"C:\Users\souno\Desktop\Projects2025\jarvis_v2\sentalign\pythonProject\SentAlign"
+TEMP_PROCESSING_DIR = os.path.join(os.getcwd(), "temp_processing")
+MODELO_EMBEDDING = 'paraphrase-multilingual-MiniLM-L12-v2'
+MACRO_SIMILARITY_THRESHOLD = 0.5
+MICRO_SIMILARITY_THRESHOLD = 0.7
+OUTPUT_DIR = 'data'
+GPU_BATCH_SIZE = 256
+
+logger = logging.getLogger(__name__)
+
+
+# --- Funções "Privadas" (Helpers) ---
+# (Todas as funções _get_corpus..., _upsert_many..., _get_full_text...,
+# _run_sentalign_subprocess, _align_one_chapter, _get_numbers_from_text,
+# _find_best_pairs... ficam 100% IGUAIS. Cole elas aqui.)
+# ... (copie e cole as 8 funções privadas daqui até a linha ~310) ...
+
+async def _get_corpus_from_titles(db: AsyncSession, import_id: int, lang: str) -> Dict[str, str]:
+    logger.info(f"Fase 1: Buscando TÍTULOS de 'ChapterIndex' para '{lang}'...")
+    stmt = select(ChapterIndex.title).where(
+        ChapterIndex.import_id == import_id,
+        ChapterIndex.lang == lang,
+        ChapterIndex.title.is_not(None),
+        func.length(ChapterIndex.title) > 2
+    ).order_by(ChapterIndex.ch_idx)
+    resultado = await db.execute(stmt)
+    mapa_de_textos: Dict[str, str] = {str(row[0]): str(row[0]) for row in resultado.all()}
+    return mapa_de_textos
+
+
+async def _get_corpus_from_content(db: AsyncSession, import_id: int, lang: str) -> Dict[str, str]:
+    logger.info(f"Fase 1: Buscando CONTEÚDO de 'ChapterText' para '{lang}'...")
+    stmt = select(
+        ChapterIndex.title,
+        ChapterText.text
+    ).join(
+        ChapterText,
+        (ChapterText.import_id == ChapterIndex.import_id) &
+        (ChapterText.lang == ChapterIndex.lang) &
+        (cast(ChapterText.ch_idx, String) == cast(ChapterIndex.ch_idx, String))
+    ).where(
+        ChapterIndex.import_id == import_id,
+        ChapterIndex.lang == lang,
+        ChapterText.text.is_not(None),
+        func.length(ChapterText.text) > 50
+    ).order_by(ChapterIndex.ch_idx)
+    resultado = await db.execute(stmt)
+    mapa_de_textos: Dict[str, str] = {str(title): str(txt) for title, txt in resultado.all()}
+    return mapa_de_textos
+
+
+async def _get_full_text_by_title(db: AsyncSession, import_id: int, lang: str, title: str) -> Optional[str]:
+    stmt = select(ChapterText.text).join(
+        ChapterIndex,
+        (ChapterIndex.import_id == ChapterText.import_id) &
+        (ChapterIndex.lang == ChapterText.lang) &
+        (cast(ChapterText.ch_idx, String) == cast(ChapterIndex.ch_idx, String))
+    ).where(
+        ChapterText.import_id == import_id,
+        ChapterText.lang == lang,
+        ChapterIndex.title == title
+    )
+    txt = await db.scalar(stmt)
+    return txt or None
+
+
 async def _upsert_many_mappings(db: AsyncSession, values_list: List[Dict[str, Any]]):
-    # (Esta função fica 100% IGUAL, ela só salva o que recebe)
     if not values_list: return
     tabela = TmWinMapping.__table__
     ins = pg_insert(tabela).values(values_list)
@@ -102,79 +195,6 @@ def _get_numbers_from_text(text: str) -> set[str]:
     return set(re.findall(r'\d+', text))
 
 
-# --- FUNÇÃO PÚBLICA 1: O AGENDADOR (Fase 1) ---
-# --- (Totalmente Refatorada) ---
-async def schedule_macro_map(import_id: int):
-    logger.info(f"JOB DE AGENDAMENTO (FASE 1) INICIADO (import_id={import_id})")
-    async with AsyncSessionLocal() as session:
-        try:
-            logger.info(f"Fase 1: Carregando modelo embedding: '{MODELO_EMBEDDING}'...")
-            model = SentenceTransformer(MODELO_EMBEDDING, device='cuda')
-
-            # 1. Busca os mapas de {href: title}
-            en_map = await _get_titles_and_hrefs(session, import_id, 'en')
-            pt_map = await _get_titles_and_hrefs(session, import_id, 'pt')
-
-            if not en_map or not pt_map:
-                raise Exception(f"Fase 1: Faltam dados em ChapterIndex (EN ou PT).")
-
-            # 2. Prepara as listas para o "DNA"
-            # Nossas "chaves" (índices) agora são os HREFS
-            en_hrefs: List[str] = list(en_map.keys())
-            en_corpus_titulos: List[str] = list(en_map.values())  # O "DNA" vem dos Títulos
-
-            pt_hrefs: List[str] = list(pt_map.keys())
-            pt_corpus_titulos: List[str] = list(pt_map.values())  # O "DNA" vem dos Títulos
-
-            # 3. Gerar Embeddings (Macro) dos TÍTULOS
-            logger.info(f"Fase 1: Gerando embeddings (Macro) dos TÍTULOS...")
-            en_embeddings = model.encode(en_corpus_titulos, show_progress_bar=False, batch_size=GPU_BATCH_SIZE)
-            pt_embeddings = model.encode(pt_corpus_titulos, show_progress_bar=False, batch_size=GPU_BATCH_SIZE)
-
-            logger.info("Fase 1: Calculando similaridade (Macro)...")
-            sim_matrix = cosine_similarity(en_embeddings, pt_embeddings)
-
-            # 4. Achar os pares e salvar
-            linhas_para_salvar_no_db: List[Dict[str, Any]] = []
-            for i in range(len(en_hrefs)):
-                en_href_chave = en_hrefs[i]  # A chave (ex: "chap1.xhtml")
-
-                best_pt_j = sim_matrix[i].argmax()
-                best_score = float(sim_matrix[i][best_pt_j])
-                pt_href_chave = pt_hrefs[best_pt_j]  # A chave PT (ex: "cap1.xhtml")
-
-                foi_match = best_score >= MACRO_SIMILARITY_THRESHOLD
-
-                # (Não podemos calcular len_src/len_tgt aqui, pois só temos os títulos)
-                # (Vamos deixar o 'len_src/len_tgt' zerado por enquanto)
-                linhas_para_salvar_no_db.append({
-                    "import_id": import_id,
-                    "ch_src": en_href_chave,  # SALVA O HREF
-                    "ch_tgt": pt_href_chave if foi_match else None,  # SALVA O HREF
-                    "sim_cosine": best_score,
-                    "len_src": 0,  # (Não temos o texto completo aqui)
-                    "len_tgt": 0,  # (Não temos o texto completo aqui)
-                    "method": "embedding_titles",
-                    "llm_score": best_score,
-                    "llm_verdict": foi_match,
-                    "llm_reason": f"Title Similarity: {best_score:.4f}",
-                    "score": best_score,
-                    "micro_status": "pending" if foi_match else "skipped",
-                })
-
-            await _upsert_many_mappings(session, linhas_para_salvar_no_db)
-            await session.commit()
-            logger.info(f"--- FASE 1 (MACRO-MAP) CONCLUÍDA ---")
-            return {"message": "Mapeamento macro (Hrefs por Títulos) concluído.",
-                    "capitulos_mapeados": len(linhas_para_salvar_no_db)}
-
-        except Exception as e:
-            await session.rollback()
-            logger.exception(f"ERRO CRÍTICO na Fase 1 para import_id={import_id}: {e}")
-            return {"error": str(e)}
-
-
-# --- "MIOLO" DA FASE 2 (Stanza + "Gambiarra" SentAlign) ---
 async def _run_sentalign_subprocess(job_folder: str, file_name: str) -> str:
     """
     Função helper que chama o sentAlign.py externo.
@@ -226,20 +246,14 @@ async def _run_sentalign_subprocess(job_folder: str, file_name: str) -> str:
 
 async def _align_one_chapter(
         db: AsyncSession,
-        nlp_en: stanza.Pipeline,  # Modelo de Segmentação EN
-        nlp_pt: stanza.Pipeline,  # Modelo de Segmentação PT
+        nlp_en: stanza.Pipeline,
+        nlp_pt: stanza.Pipeline,
         import_id: int,
-        ch_src_href: str  # <-- Agora recebemos o HREF
+        ch_src_href: str
 ) -> Dict[str, Any]:
-    """
-    Esta é a lógica interna da Fase 2.
-    *** ATUALIZADO: Recebe Hrefs (ch_idx) e chama o SentAlign ***
-    """
-
     job_folder = ""
 
     try:
-        # 1. Buscar os dados do capítulo
         mapa = await db.get(TmWinMapping, (import_id, ch_src_href))
         if not mapa:
             raise Exception(f"Capítulo (href) '{ch_src_href}' não encontrado no mapa.")
@@ -251,14 +265,12 @@ async def _align_one_chapter(
 
         ch_tgt_href = str(mapa.ch_tgt)
 
-        # Busca os textos usando os HREFS (que são o ch_idx)
-        texto_en = await _get_full_text_by_href(db, import_id, 'en', ch_src_href)
-        texto_pt = await _get_full_text_by_href(db, import_id, 'pt', ch_tgt_href)
+        texto_en = await _get_full_text_by_title(db, import_id, 'en', ch_src_href)
+        texto_pt = await _get_full_text_by_title(db, import_id, 'pt', ch_tgt_href)
 
         if not texto_en or not texto_pt:
             raise Exception(f"Texto EN ou PT não encontrado para o par '{ch_src_href}' -> '{ch_tgt_href}'.")
 
-        # 2. Segmentar (Stanza)
         logger.info(f"Fase 2: Segmentando '{ch_src_href}' com Stanza (na GPU)...")
         doc_en = nlp_en(texto_en)
         doc_pt = nlp_pt(texto_pt)
@@ -275,7 +287,6 @@ async def _align_one_chapter(
         logger.info(
             f"Fase 2: Segmentado (com Stanza) '{ch_src_href}'. {len(sentencas_en_lista)} EN vs {len(sentencas_pt_lista)} PT.")
 
-        # 3. Criar a "sandbox" (arquivos temporários)
         job_id = str(uuid.uuid4())
         job_folder = os.path.join(TEMP_PROCESSING_DIR, job_id)
         eng_folder = os.path.join(job_folder, "eng")
@@ -294,10 +305,8 @@ async def _align_one_chapter(
 
         logger.info(f"Fase 2: Arquivos de SENTENÇAS temporários criados em {job_folder}")
 
-        # 4. Chamar o Subprocess (SentAlign)
         output_file_path = await _run_sentalign_subprocess(job_folder, file_name)
 
-        # 5. Ler o resultado
         logger.info(f"Fase 2: Lendo resultado de {output_file_path}")
         pares_para_salvar: List[Dict[str, Any]] = []
         with open(output_file_path, 'r', encoding='utf-8') as f_in:
@@ -310,7 +319,7 @@ async def _align_one_chapter(
                         if score >= MICRO_SIMILARITY_THRESHOLD:
                             pares_para_salvar.append({
                                 "import_id": import_id,
-                                "ch_src": ch_src_href,  # Salva o Href
+                                "ch_src": ch_src_href,
                                 "source_text": en_line,
                                 "target_text": pt_line,
                                 "similarity_score": score
@@ -320,7 +329,6 @@ async def _align_one_chapter(
 
         logger.info(f"Fase 2: Encontrados {len(pares_para_salvar)} pares (acima de {MICRO_SIMILARITY_THRESHOLD}).")
 
-        # 6. Salvar os pares no banco
         if pares_para_salvar:
             ins = pg_insert(TmAlignedSentences).values(pares_para_salvar)
             stmt = ins.on_conflict_do_nothing(
@@ -328,7 +336,6 @@ async def _align_one_chapter(
             )
             await db.execute(stmt)
 
-        # 7. ATUALIZAR O STATUS final
         mapa.micro_status = "aligned"
         await db.commit()
 
@@ -347,7 +354,6 @@ async def _align_one_chapter(
         return {"error": str(e)}
 
     finally:
-        # 8. LIMPAR
         if os.path.exists(job_folder):
             try:
                 shutil.rmtree(job_folder)
@@ -356,11 +362,75 @@ async def _align_one_chapter(
                 logger.error(f"Fase 2: Falha ao limpar pasta {job_folder}: {e}")
 
 
+# --- FUNÇÃO PÚBLICA 1: O AGENDADOR (Fase 1) ---
+async def schedule_macro_map(import_id: int):
+    # (Esta função fica 100% IGUAL)
+    logger.info(f"JOB DE AGENDAMENTO (FASE 1) INICIADO (import_id={import_id})")
+    async with AsyncSessionLocal() as session:
+        try:
+            logger.info(f"Fase 1: Carregando modelo embedding: '{MODELO_EMBEDDING}'...")
+            model = SentenceTransformer(MODELO_EMBEDDING, device='cuda')
+
+            en_texts_map = await _get_corpus_from_content(session, import_id, 'en')
+            pt_texts_map = await _get_corpus_from_content(session, import_id, 'pt')
+
+            if not en_texts_map:
+                en_texts_map = await _get_corpus_from_titles(session, import_id, 'en')
+            if not pt_texts_map:
+                pt_texts_map = await _get_corpus_from_titles(session, import_id, 'pt')
+
+            en_indices: List[str] = list(en_texts_map.keys())
+            en_corpus: List[str] = list(en_texts_map.values())
+            pt_indices: List[str] = list(pt_texts_map.keys())
+            pt_corpus: List[str] = list(pt_texts_map.values())
+
+            if not en_corpus or not pt_corpus:
+                raise Exception(f"Fase 1: Faltam dados em EN ou PT.")
+
+            logger.info(f"Fase 1: Gerando embeddings (Macro)...")
+            en_embeddings = model.encode(en_corpus, show_progress_bar=False, batch_size=GPU_BATCH_SIZE)
+            pt_embeddings = model.encode(pt_corpus, show_progress_bar=False, batch_size=GPU_BATCH_SIZE)
+
+            logger.info("Fase 1: Calculando similaridade (Macro)...")
+            sim_matrix = cosine_similarity(en_embeddings, pt_embeddings)
+
+            linhas_para_salvar_no_db: List[Dict[str, Any]] = []
+            for i in range(len(en_indices)):
+                ch_en_idx_str = en_indices[i]
+                best_pt_j = sim_matrix[i].argmax()
+                best_score = float(sim_matrix[i][best_pt_j])
+                best_pt_idx_str = pt_indices[best_pt_j]
+                foi_match = best_score >= MACRO_SIMILARITY_THRESHOLD
+
+                linhas_para_salvar_no_db.append({
+                    "import_id": import_id, "ch_src": ch_en_idx_str,
+                    "ch_tgt": best_pt_idx_str if foi_match else None,
+                    "sim_cosine": best_score, "len_src": len(en_corpus[i]),
+                    "len_tgt": len(pt_corpus[best_pt_j]),
+                    "method": "embedding_titles",
+                    "llm_score": best_score,
+                    "llm_verdict": foi_match,
+                    "llm_reason": f"Cosine similarity: {best_score:.4f}",
+                    "score": best_score,
+                    "micro_status": "pending" if foi_match else "skipped",
+                })
+
+            await _upsert_many_mappings(session, linhas_para_salvar_no_db)
+            await session.commit()
+            logger.info(f"--- FASE 1 (MACRO-MAP) CONCLUÍDA ---")
+            return {"message": "Mapeamento macro (Hrefs por Títulos) concluído.",
+                    "capitulos_mapeados": len(linhas_para_salvar_no_db)}
+
+        except Exception as e:
+            await session.rollback()
+            logger.exception(f"ERRO CRÍTICO na Fase 1 para import_id={import_id}: {e}")
+            return {"error": str(e)}
+
+
 # --- FUNÇÃO PÚBLICA 2: O ALINHADOR DE 1 CAPÍTULO (Fase 2) ---
 async def run_sentence_alignment(import_id: int, ch_src: str):
     logger.info(f"JOB DE ALINHAMENTO (FASE 2) INICIADO (import_id={import_id}, cap_href={ch_src})")
 
-    # 1. Carregar (apenas) o Stanza
     try:
         logger.info("Fase 2: Carregando modelos de segmentação Stanza (pode baixar na 1ª vez)...")
         stanza.download('en', logging_level='WARN', processors='tokenize')
@@ -372,7 +442,6 @@ async def run_sentence_alignment(import_id: int, ch_src: str):
         logger.exception(f"Fase 2: Falha ao carregar modelos Stanza. Abortando. {e}")
         return {"error": f"Falha ao carregar modelos Stanza: {e}"}
 
-    # 2. Abrir sessão e chamar o "miolo"
     async with AsyncSessionLocal() as session:
         result = await _align_one_chapter(session, nlp_en, nlp_pt, import_id, ch_src)
         return result
@@ -382,7 +451,6 @@ async def run_sentence_alignment(import_id: int, ch_src: str):
 async def run_alignment_for_all_pending(import_id: int):
     logger.info(f"JOB DE ALINHAMENTO COMPLETO (FASE 2) INICIADO (import_id={import_id})")
 
-    # 1. Carregar (apenas) o Stanza (uma vez)
     try:
         logger.info("Fase 2 (Full): Carregando modelos de segmentação Stanza...")
         stanza.download('en', logging_level='WARN', processors='tokenize')
@@ -394,7 +462,6 @@ async def run_alignment_for_all_pending(import_id: int):
         return
 
     async with AsyncSessionLocal() as session:
-        # 2. Buscar a lista COMPLETA de capítulos pendentes
         stmt = select(TmWinMapping.ch_src).where(
             TmWinMapping.import_id == import_id,
             TmWinMapping.micro_status == "pending"
@@ -408,7 +475,6 @@ async def run_alignment_for_all_pending(import_id: int):
             logger.info("Fase 2 (Full): Nenhum capítulo pendente. Trabalho concluído.")
             return
 
-        # 3. Loop de processamento
         processados_com_sucesso = 0
         processados_com_erro = 0
         for i, ch_src in enumerate(lista_de_capitulos_pendentes):
@@ -562,3 +628,59 @@ async def get_corpus_status(import_id: int):
             stats["status_frases"]["total_alinhado"] += count
 
         return {"import_id": import_id, "status": stats}
+
+
+# --- (NOVAS FUNÇÕES PARA O "BOTÃO MESTRE") ---
+
+async def _find_pending_macro_map_imports() -> List[int]:
+    """
+    Busca no 'tm_import' todos os IDs que ainda não
+    têm nenhuma entrada no 'tm_win_mapping'.
+    """
+    logger.info("Fase 1 (Master): Buscando imports pendentes (que não estão no tm_win_mapping)...")
+    async with AsyncSessionLocal() as session:
+        # Subquery: Pega todos os import_ids que JÁ TÊM entradas no mapa
+        sub_q = select(distinct(TmWinMapping.import_id)).subquery()
+
+        # Query Principal: Pega todos os imports ONDE o ID NÃO ESTÁ na subquery
+        stmt = select(models.Import.id).where(
+            models.Import.id.notin_(
+                select(sub_q)
+            )
+        ).order_by(models.Import.id)
+
+        resultado = (await session.execute(stmt)).scalars().all()
+        return list(resultado)
+
+
+async def schedule_macro_map_for_all_pending():
+    """
+    Função pública "Mestra" que a API chama em background.
+    Ela acha todos os IDs pendentes e roda a Fase 1 para cada um.
+    """
+    logger.info("JOB MESTRE (FASE 1) INICIADO: Processando todos os imports pendentes.")
+    try:
+        pending_ids = await _find_pending_macro_map_imports()
+        if not pending_ids:
+            logger.info("JOB MESTRE (FASE 1): Nenhum import pendente encontrado. Trabalho concluído.")
+            return
+
+        logger.info(f"JOB MESTRE (FASE 1): {len(pending_ids)} imports encontrados. Iniciando loop.")
+
+        processados_com_sucesso = 0
+        processados_com_erro = 0
+
+        for import_id in pending_ids:
+            logger.info(f"JOB MESTRE (FASE 1): Processando import_id={import_id}...")
+            # Chama a função original (que abre sua própria sessão)
+            result = await schedule_macro_map(import_id)
+            if "error" in result:
+                processados_com_erro += 1
+            else:
+                processados_com_sucesso += 1
+
+        logger.info("JOB MESTRE (FASE 1): Todos os imports pendentes foram processados.")
+        logger.info(f"Resultados: {processados_com_sucesso} com sucesso, {processados_com_erro} com erro.")
+
+    except Exception as e:
+        logger.exception(f"ERRO CRÍTICO no Job Mestre (Fase 1): {e}")

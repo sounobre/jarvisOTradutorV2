@@ -1,13 +1,13 @@
 # --- ARQUIVO ATUALIZADO (O "PAINEL DE CONTROLE"): api/chapter_window_map.py ---
 """
 Este é o "Painel de Controle" da API (Arquitetura "Embeddings-Only").
-Agora inclui o botão "Processar Tudo".
+*** ATUALIZADO: O "Botão 1" agora tem o "Modo Automático" ***
 """
 from __future__ import annotations
 import logging
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional  # <-- Importa o 'Optional'
 
 from db.session import get_db
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -20,7 +20,9 @@ from services.corpus_builder_service import (
     run_sentence_alignment,
     export_corpus_to_tsv,
     get_corpus_status,
-    run_alignment_for_all_pending, run_corpus_validation  # <-- A NOVA FUNÇÃO
+    run_alignment_for_all_pending,
+    run_corpus_validation,
+    schedule_macro_map_for_all_pending  # <-- A NOVA "FUNÇÃO MESTRA"
 )
 
 router = APIRouter(prefix="/epub/corpus_v2", tags=["corpus-pipeline-v2"])
@@ -28,8 +30,11 @@ logger = logging.getLogger(__name__)
 
 
 # -------- Modelos de Request (Payloads) --------
+
+# --- MUDANÇA 1: 'import_id' agora é OPCIONAL ---
 class JobRequest(BaseModel):
-    import_id: int = Field(..., description="ID do livro em tm_import")
+    import_id: Optional[int] = Field(None,
+                                     description="ID do livro em tm_import. Se omitido, processa TODOS os pendentes.")
 
 
 class AlignOneChapterRequest(BaseModel):
@@ -37,28 +42,54 @@ class AlignOneChapterRequest(BaseModel):
     ch_src: str = Field(..., description="O TÍTULO do capítulo EN para processar (ex: 'Chapter 1')")
 
 
+class ExportRequest(BaseModel):
+    import_id: int = Field(..., description="ID do livro em tm_import")
+    min_score: Optional[float] = Field(0.7, description="Score de similaridade mínimo (0.0 a 1.0)")
+    max_len_ratio: Optional[float] = Field(3.0,
+                                           description="Ratio máximo (PT/EN). 3.0 = PT pode ter até 3x o tamanho do EN.")
+    require_number_match: Optional[bool] = Field(True,
+                                                 description="Se True, descarta pares onde os números (dígitos) não batem.")
+
+
 # -------- Endpoints (Os Botões) --------
 
+# --- MUDANÇA 2: Lógica "Inteligente" no Botão 1 ---
 @router.post("/1-schedule-macro-map")
 async def schedule_macro_map_endpoint(
-        req: JobRequest,
+        req: JobRequest,  # <-- Usa o novo payload
         background_tasks: BackgroundTasks,
 ):
     """
     Botão 1: Roda a Fase 1 (Mapa Macro).
-    Salva na 'TmWinMapping' com status 'pending'.
+    - Se 'import_id' for fornecido: Roda a Fase 1 para esse ID.
+    - Se 'import_id' for omitido (corpo vazio {}): Roda a Fase 1
+      para TODOS os 'import_id' que ainda não foram processados.
     """
     try:
-        background_tasks.add_task(schedule_macro_map, req.import_id)
-        logger.info(f"Endpoint 1: Job de Agendamento (Macro-Map) iniciado para import_id={req.import_id}.")
-        return {
-            "status": "macro_map_job_scheduled",
-            "import_id": req.import_id,
-            "message": "Fase 1 (Mapeamento de Capítulos) iniciada em background."
-        }
+        if req.import_id:
+            # --- Modo 1: Processamento Único ---
+            background_tasks.add_task(schedule_macro_map, req.import_id)
+            logger.info(f"Endpoint 1: Job de Agendamento (Macro-Map) iniciado para import_id={req.import_id}.")
+            return {
+                "status": "macro_map_job_scheduled",
+                "import_id": req.import_id,
+                "message": "Fase 1 (Mapeamento de Capítulos) iniciada em background."
+            }
+        else:
+            # --- Modo 2: "Modo Automático" ---
+            background_tasks.add_task(schedule_macro_map_for_all_pending)
+            logger.info(f"Endpoint 1: Job MESTRE (Macro-Map) iniciado para TODOS os imports pendentes.")
+            return {
+                "status": "master_macro_map_job_scheduled",
+                "message": "Fase 1 (Mapeamento de Capítulos) iniciada em background para TODOS os imports pendentes."
+            }
+
     except Exception as e:
         logger.exception(f"Falha ao agendar job 1 para import_id={req.import_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Erro ao agendar: {e}")
+
+
+# --- FIM DA MUDANÇA ---
 
 
 @router.post("/2-align-next-pending-chapter")
@@ -70,8 +101,11 @@ async def align_next_pending_chapter_endpoint(
     Botão 2 (Automático): Processa o PRÓXIMO capítulo 'pending'.
     Este endpoint ESPERA o alinhamento (15-30s) terminar.
     """
+    # (Este endpoint precisa de um ID, então a lógica não muda)
+    if not req.import_id:
+        raise HTTPException(status_code=400, detail="import_id é obrigatório para este endpoint.")
+
     try:
-        # 1. Encontra o próximo capítulo "pending"
         stmt = select(TmWinMapping.ch_src).where(
             TmWinMapping.import_id == req.import_id,
             TmWinMapping.micro_status == "pending"
@@ -80,13 +114,11 @@ async def align_next_pending_chapter_endpoint(
         proximo_capitulo = (await db.execute(stmt)).scalar_one_or_none()
 
         if not proximo_capitulo:
-            logger.info(f"Endpoint 2: Nenhum capítulo 'pending' encontrado para import_id={req.import_id}.")
             return {"message": "Nenhum capítulo pendente encontrado. Alinhamento concluído!",
                     "import_id": req.import_id}
 
         ch_src_str = str(proximo_capitulo)
 
-        # 2. CHAMA E ESPERA
         logger.info(f"Endpoint 2: INICIANDO alinhamento síncrono para: '{ch_src_str}'.")
         result_json = await run_sentence_alignment(req.import_id, ch_src_str)
         logger.info(f"Endpoint 2: CONCLUÍDO alinhamento para: '{ch_src_str}'.")
@@ -100,7 +132,6 @@ async def align_next_pending_chapter_endpoint(
         raise HTTPException(status_code=500, detail=f"Erro ao agendar: {e}")
 
 
-# --- NOVO ENDPOINT (O que você pediu) ---
 @router.post("/2c-align-all-pending")
 async def align_all_pending_endpoint(
         req: JobRequest,
@@ -109,12 +140,12 @@ async def align_all_pending_endpoint(
 ):
     """
     Botão 2-C (Processar Tudo): Processa TODOS os capítulos 'pending'.
-
-    Este endpoint é em BACKGROUND (não espera), pois pode
-    levar muitos minutos (ex: 50 caps * 30s = 25 min).
+    Roda em BACKGROUND.
     """
+    if not req.import_id:
+        raise HTTPException(status_code=400, detail="import_id é obrigatório para este endpoint.")
+
     try:
-        # 1. Checagem rápida para ver se há trabalho a fazer
         stmt = select(TmWinMapping.ch_src).where(
             TmWinMapping.import_id == req.import_id,
             TmWinMapping.micro_status == "pending"
@@ -124,7 +155,6 @@ async def align_all_pending_endpoint(
             logger.info(f"Endpoint 2C: Nenhum capítulo 'pending' encontrado.")
             return {"message": "Nenhum capítulo pendente encontrado."}
 
-        # 2. Agenda o "loop" completo em background
         background_tasks.add_task(run_alignment_for_all_pending, req.import_id)
 
         logger.info(f"Endpoint 2C: Job de Alinhamento COMPLETO (Fase 2) iniciado para import_id={req.import_id}.")
@@ -138,15 +168,12 @@ async def align_all_pending_endpoint(
         raise HTTPException(status_code=500, detail=f"Erro ao agendar: {e}")
 
 
-# --- FIM DO NOVO ENDPOINT ---
-
 @router.post("/2b-align-specific-chapter")
 async def align_specific_chapter_endpoint(
         req: AlignOneChapterRequest,
 ):
     """
-    Botão 2 (Manual): Processa um capítulo específico.
-    Também espera o trabalho terminar (síncrono).
+    Botão 2 (Manual): Processa um capítulo específico (Síncrono).
     """
     try:
         logger.info(f"Endpoint 2b: INICIANDO alinhamento síncrono para: '{req.ch_src}'.")
@@ -162,24 +189,54 @@ async def align_specific_chapter_endpoint(
         raise HTTPException(status_code=500, detail=f"Erro ao agendar: {e}")
 
 
-@router.post("/3-export-corpus")
-async def export_corpus_endpoint(
+@router.post("/3-validate-corpus")
+async def validate_corpus_endpoint(
         req: JobRequest,
         background_tasks: BackgroundTasks,
 ):
     """
-    Botão 3: Roda a Fase 3 (Exportação Final).
+    Botão 3: Roda a Fase 3 (Validação de Sanidade).
     """
+    if not req.import_id:
+        raise HTTPException(status_code=400, detail="import_id é obrigatório para este endpoint.")
+
     try:
-        background_tasks.add_task(export_corpus_to_tsv, req.import_id)
-        logger.info(f"Endpoint 3: Job de Exportação (Fase 3) iniciado para import_id={req.import_id}.")
+        background_tasks.add_task(run_corpus_validation, req.import_id)
+        logger.info(f"Endpoint 3: Job de Validação (Fase 3) iniciado para import_id={req.import_id}.")
         return {
-            "status": "export_job_scheduled",
+            "status": "validation_job_scheduled",
             "import_id": req.import_id,
-            "message": "Fase 3 (Exportação para .tsv) iniciada em background."
+            "message": "Fase 3 (Validação de Pares) iniciada em background."
         }
     except Exception as e:
         logger.exception(f"Falha ao agendar job 3 para import_id={req.import_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Erro ao agendar validação: {e}")
+
+
+@router.post("/4-export-corpus")
+async def export_corpus_endpoint(
+        req: ExportRequest,  # <-- Usa o payload de filtros
+        background_tasks: BackgroundTasks,
+):
+    """
+    Botão 4: Roda a Fase 4 (Exportação Final).
+    """
+    try:
+        background_tasks.add_task(
+            export_corpus_to_tsv,
+            req.import_id,
+            req.min_score,
+            req.max_len_ratio,
+            req.require_number_match
+        )
+        logger.info(f"Endpoint 4: Job de Exportação (Fase 4) iniciado para import_id={req.import_id}.")
+        return {
+            "status": "export_job_scheduled",
+            "import_id": req.import_id,
+            "message": "Fase 4 (Exportação Premium para .tsv) iniciada em background."
+        }
+    except Exception as e:
+        logger.exception(f"Falha ao agendar job 4 para import_id={req.import_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Erro ao agendar exportação: {e}")
 
 
@@ -196,29 +253,3 @@ async def get_status_endpoint(
         return stats
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao buscar status: {e}")
-
-
-# --- (NOVO) BOTÃO 3: VALIDAÇÃO ---
-@router.post("/3-validate-corpus")
-async def validate_corpus_endpoint(
-        req: JobRequest,
-        background_tasks: BackgroundTasks,
-):
-    """
-    Botão 3: Roda a Fase 3 (Validação de Sanidade).
-
-    Processa TODOS os pares alinhados (status 'pending') e
-    calcula as métricas extras (len_ratio, number_mismatch).
-    Roda em BACKGROUND.
-    """
-    try:
-        background_tasks.add_task(run_corpus_validation, req.import_id)
-        logger.info(f"Endpoint 3: Job de Validação (Fase 3) iniciado para import_id={req.import_id}.")
-        return {
-            "status": "validation_job_scheduled",
-            "import_id": req.import_id,
-            "message": "Fase 3 (Validação de Pares) iniciada em background."
-        }
-    except Exception as e:
-        logger.exception(f"Falha ao agendar job 3 para import_id={req.import_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Erro ao agendar validação: {e}")
