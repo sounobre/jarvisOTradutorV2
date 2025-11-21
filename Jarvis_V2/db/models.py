@@ -161,3 +161,61 @@ class TmAlignedSentences(Base):
         UniqueConstraint("import_id", "ch_src", "source_text", "target_text", name="uq_aligned_pair"),
         Index("idx_aligned_import_status", "import_id", "validation_status"),  # Novo índice
     )
+
+
+class TmGlossary(Base):
+    """
+    Tabela de Termos para garantir consistência.
+    Ex:
+    term_source="High Lord", term_target="Grão-Senhor"
+    term_source="Rhysand", term_target="Rhysand" (Para não traduzir)
+    """
+    __tablename__ = "tm_glossary"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    import_id: Mapped[int] = mapped_column(ForeignKey("tm_import.id", ondelete="CASCADE"), nullable=False, index=True)
+
+    term_source: Mapped[str] = mapped_column(Text, nullable=False)  # O termo em Inglês
+    term_target: Mapped[str] = mapped_column(Text, nullable=False)  # A tradução desejada (ou o mesmo nome)
+
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        # Evita duplicatas do mesmo termo para o mesmo livro
+        UniqueConstraint("import_id", "term_source", name="uq_glossary_term"),
+    )
+
+
+# --- NOVO MODELO: db/models.py ---
+
+class TmTranslationLog(Base):
+    """
+    Histórico detalhado de cada pedaço (chunk) traduzido.
+    Essencial para comparar modelos e criar datasets de treino.
+    """
+    __tablename__ = "tm_translation_log"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    import_id: Mapped[int] = mapped_column(ForeignKey("tm_import.id", ondelete="CASCADE"), nullable=False, index=True)
+
+    # Onde isso aconteceu?
+    file_name: Mapped[str] = mapped_column(String(255), nullable=False)  # ex: 'Chapter1.xhtml'
+    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)  # ex: Chunk 1, 2, 3...
+
+    # O "Antes" e "Depois"
+    source_text: Mapped[str] = mapped_column(Text, nullable=False)  # O texto em Inglês
+    translated_text: Mapped[str] = mapped_column(Text, nullable=False)  # O resultado do Modelo
+
+    # Metadados Científicos (Para reproduzir o resultado)
+    model_name: Mapped[str] = mapped_column(String(128), nullable=False)  # ex: 'Qwen/Qwen2.5-7B...'
+    prompt_snapshot: Mapped[str] = mapped_column(Text, nullable=False)  # O prompt exato usado
+    temperature: Mapped[float] = mapped_column(Float, nullable=False)  # Parâmetro usado
+
+    # Performance
+    duration_seconds: Mapped[float] = mapped_column(Float, nullable=False)  # Quanto tempo levou
+
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index("idx_trans_log_import", "import_id"),
+    )
