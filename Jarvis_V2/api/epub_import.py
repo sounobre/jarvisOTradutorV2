@@ -81,3 +81,50 @@ async def create_import(
         },
         "message": "Import + livros + capítulos persistidos com sucesso.",
     }
+
+
+@router.post("/import-single")
+async def create_single_import(
+        name: str = Form(...),
+        file_en: UploadFile = File(...),
+        db: AsyncSession = Depends(get_db),
+):
+    """
+    Importa APENAS o livro em Inglês para fins de Tradução (sem par).
+    """
+    # 1) Salvar arquivo
+    bucket = str(uuid.uuid4())
+    outdir = os.path.join(UPLOAD_BASE, bucket)
+    os.makedirs(outdir, exist_ok=True)
+
+    en_path = os.path.join(outdir, f"en_{file_en.filename}")
+    # Normaliza path
+    en_path = en_path.replace("\\", "/")
+
+    with open(en_path, "wb") as f:
+        shutil.copyfileobj(file_en.file, f)
+
+    # 2) Cria tm_import (file_pt será NULL)
+    res = await db.execute(
+        insert(models.Import)
+        .values(name=name, file_en=en_path, file_pt=None)
+        .returning(models.Import.id)
+    )
+    import_id = res.scalar_one()
+    await db.commit()
+
+    # 3) Persiste
+    try:
+        book_en_id, _ = await persist_books_and_chapters(
+            db=db, import_id=import_id, path_en=en_path, path_pt=None
+        )
+    except Exception as e:
+        logger.exception(f"Erro na persistência: {e}")
+        raise HTTPException(status_code=500, detail=f"Erro: {e}")
+
+    return {
+        "id": import_id,
+        "name": name,
+        "message": "Livro EN importado com sucesso. Pronto para tradução.",
+        "book_en_id": book_en_id
+    }

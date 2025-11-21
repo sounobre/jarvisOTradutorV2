@@ -18,7 +18,7 @@ class Import(Base):
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     file_en: Mapped[str] = mapped_column(Text, nullable=False)
-    file_pt: Mapped[str] = mapped_column(Text, nullable=False)
+    file_pt: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class Book(Base):

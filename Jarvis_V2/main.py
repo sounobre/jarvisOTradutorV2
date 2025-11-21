@@ -10,7 +10,7 @@ Conceitos:
 import os
 import sys
 
-from api import epub_import, chapter_window_map, epub_bulk_import
+from api import epub_import, chapter_window_map, epub_bulk_import, translation_api
 
 try:
     if os.name == "nt":
@@ -73,3 +73,4 @@ app.include_router(epub_import.router)
 
 app.include_router(chapter_window_map.router)  # <-- ADICIONE ESTA LINHA
 app.include_router(epub_bulk_import.router)
+app.include_router(translation_api.router)

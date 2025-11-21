@@ -22,7 +22,8 @@ from services.corpus_builder_service import (
     get_corpus_status,
     run_alignment_for_all_pending,
     run_corpus_validation,
-    schedule_macro_map_for_all_pending  # <-- A NOVA "FUNÇÃO MESTRA"
+    schedule_macro_map_for_all_pending, run_master_alignment_job,
+    run_master_validation_job  # <-- A NOVA "FUNÇÃO MESTRA"
 )
 
 router = APIRouter(prefix="/epub/corpus_v2", tags=["corpus-pipeline-v2"])
@@ -139,32 +140,41 @@ async def align_all_pending_endpoint(
         db: AsyncSession = Depends(get_db)
 ):
     """
-    Botão 2-C (Processar Tudo): Processa TODOS os capítulos 'pending'.
-    Roda em BACKGROUND.
+    Botão 2-C (Processar Tudo):
+    - Se 'import_id' for enviado: Processa todos os capítulos daquele livro.
+    - Se 'import_id' for vazio: Processa TODOS os livros pendentes no banco.
     """
-    if not req.import_id:
-        raise HTTPException(status_code=400, detail="import_id é obrigatório para este endpoint.")
-
     try:
-        stmt = select(TmWinMapping.ch_src).where(
-            TmWinMapping.import_id == req.import_id,
-            TmWinMapping.micro_status == "pending"
-        ).limit(1)
+        if req.import_id:
+            # --- MODO 1: Um Livro Específico ---
+            stmt = select(TmWinMapping.ch_src).where(
+                TmWinMapping.import_id == req.import_id,
+                TmWinMapping.micro_status == "pending"
+            ).limit(1)
 
-        if not (await db.execute(stmt)).scalar_one_or_none():
-            logger.info(f"Endpoint 2C: Nenhum capítulo 'pending' encontrado.")
-            return {"message": "Nenhum capítulo pendente encontrado."}
+            if not (await db.execute(stmt)).scalar_one_or_none():
+                logger.info(f"Endpoint 2C: Nenhum capítulo 'pending' encontrado para import_id={req.import_id}.")
+                return {"message": "Nenhum capítulo pendente encontrado para este livro."}
 
-        background_tasks.add_task(run_alignment_for_all_pending, req.import_id)
+            background_tasks.add_task(run_alignment_for_all_pending, req.import_id)
+            logger.info(f"Endpoint 2C: Job iniciado para import_id={req.import_id}.")
+            return {
+                "status": "full_alignment_job_scheduled",
+                "import_id": req.import_id,
+                "message": "Fase 2 (Alinhamento do Livro) iniciada em background."
+            }
 
-        logger.info(f"Endpoint 2C: Job de Alinhamento COMPLETO (Fase 2) iniciado para import_id={req.import_id}.")
-        return {
-            "status": "full_alignment_job_scheduled",
-            "import_id": req.import_id,
-            "message": "Fase 2 (Loop de Alinhamento de Todos os Capítulos) iniciada em background."
-        }
+        else:
+            # --- MODO 2: Automático (Todos os Livros) ---
+            background_tasks.add_task(run_master_alignment_job)
+            logger.info(f"Endpoint 2C: Job MESTRE iniciado para TODOS os livros pendentes.")
+            return {
+                "status": "master_alignment_job_scheduled",
+                "message": "Fase 2 (Job Mestre) iniciada em background para TODOS os livros pendentes."
+            }
+
     except Exception as e:
-        logger.exception(f"Falha ao agendar job 2C para import_id={req.import_id}: {e}")
+        logger.exception(f"Falha ao agendar job 2C: {e}")
         raise HTTPException(status_code=500, detail=f"Erro ao agendar: {e}")
 
 
@@ -191,22 +201,29 @@ async def align_specific_chapter_endpoint(
 
 @router.post("/3-validate-corpus")
 async def validate_corpus_endpoint(
-        req: JobRequest,
-        background_tasks: BackgroundTasks,
+    req: JobRequest, # 'import_id' é Optional[int] neste modelo
+    background_tasks: BackgroundTasks,
 ):
     """
     Botão 3: Roda a Fase 3 (Validação de Sanidade).
+    - Com ID: Valida o livro específico.
+    - Sem ID: Valida TODOS os livros com pares alinhados.
     """
-    if not req.import_id:
-        raise HTTPException(status_code=400, detail="import_id é obrigatório para este endpoint.")
-
     try:
-        background_tasks.add_task(run_corpus_validation, req.import_id)
-        logger.info(f"Endpoint 3: Job de Validação (Fase 3) iniciado para import_id={req.import_id}.")
+        if req.import_id:
+            # MODO 1: Processamento Único
+            background_tasks.add_task(run_corpus_validation, req.import_id)
+            message = f"Validação iniciada para import_id={req.import_id}."
+        else:
+            # MODO 2: Master (Todos os livros que têm validação pendente)
+            background_tasks.add_task(run_master_validation_job)
+            message = "Fase 3 (Job Mestre) iniciada em background para TODOS os imports pendentes."
+
+        logger.info(f"Endpoint 3: Job de Validação (Fase 3) iniciado. {message}")
         return {
             "status": "validation_job_scheduled",
-            "import_id": req.import_id,
-            "message": "Fase 3 (Validação de Pares) iniciada em background."
+            "import_id": req.import_id if req.import_id else "ALL",
+            "message": message
         }
     except Exception as e:
         logger.exception(f"Falha ao agendar job 3 para import_id={req.import_id}: {e}")
@@ -240,16 +257,22 @@ async def export_corpus_endpoint(
         raise HTTPException(status_code=500, detail=f"Erro ao agendar exportação: {e}")
 
 
+# --- ARQUIVO: api/chapter_window_map.py ---
+
 @router.get("/get-status")
 async def get_status_endpoint(
-        import_id: int,
-        db: AsyncSession = Depends(get_db)
+    import_id: Optional[int] = None, # <-- Agora é Opcional (pode ser vazio)
+    db: AsyncSession = Depends(get_db)
 ):
     """
-    (Tela de Status) Checa o progresso do Mapeamento de Capítulos.
+    (Tela de Status)
+    - Com ID: Mostra status do livro.
+    - Sem ID: Lista o status de TODOS os livros processados.
     """
     try:
+        # A lógica agora está toda dentro do serviço
         stats = await get_corpus_status(import_id)
         return stats
     except Exception as e:
+        logger.exception(f"Erro ao buscar status: {e}") # Loga o erro completo no console
         raise HTTPException(status_code=500, detail=f"Erro ao buscar status: {e}")
