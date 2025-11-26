@@ -431,14 +431,24 @@ def create_anchor_files(file_name, sentence_overlap, lengthfilter):
     anchor_overlaps_source_file = temporary_folder + '/anchoroverlaps.' + file_name + '.src.'
     anchor_overlaps_target_file = temporary_folder + '/anchoroverlaps.' + file_name + '.trg.'
 
-    src_num_overlaps_file = open(src_overlaps_file + '.overlaps').readlines()
-    src_length_file = open(src_overlaps_file + '.lengthok').readlines()
-    src_linunum_file = open(src_overlaps_file + '.linenumbers').readlines()
-    src_overlaps_used = open(src_overlaps_file_used).readlines()
-    trg_num_overlaps_file = open(trg_overlaps_file + '.overlaps').readlines()
-    trg_length_file = open(trg_overlaps_file + '.lengthok').readlines()
-    trg_linunum_file = open(trg_overlaps_file + '.linenumbers').readlines()
-    trg_overlaps_used = open(trg_overlaps_file_used).readlines()
+    # src_num_overlaps_file = open(src_overlaps_file + '.overlaps').readlines()
+    # src_length_file = open(src_overlaps_file + '.lengthok').readlines()
+    # src_linunum_file = open(src_overlaps_file + '.linenumbers').readlines()
+    # src_overlaps_used = open(src_overlaps_file_used).readlines()
+    # trg_num_overlaps_file = open(trg_overlaps_file + '.overlaps').readlines()
+    # trg_length_file = open(trg_overlaps_file + '.lengthok').readlines()
+    # trg_linunum_file = open(trg_overlaps_file + '.linenumbers').readlines()
+    # trg_overlaps_used = open(trg_overlaps_file_used).readlines()
+
+    src_num_overlaps_file = open(src_overlaps_file + '.overlaps', encoding='utf-8').readlines()
+    src_length_file = open(src_overlaps_file + '.lengthok', encoding='utf-8').readlines()
+    src_linunum_file = open(src_overlaps_file + '.linenumbers', encoding='utf-8').readlines()
+    src_overlaps_used = open(src_overlaps_file_used, encoding='utf-8').readlines()
+
+    trg_num_overlaps_file = open(trg_overlaps_file + '.overlaps', encoding='utf-8').readlines()
+    trg_length_file = open(trg_overlaps_file + '.lengthok', encoding='utf-8').readlines()
+    trg_linunum_file = open(trg_overlaps_file + '.linenumbers', encoding='utf-8').readlines()
+    trg_overlaps_used = open(trg_overlaps_file_used, encoding='utf-8').readlines()
 
     anchor_source_list = []
     anchor_target_list = []

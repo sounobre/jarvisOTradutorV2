@@ -2,6 +2,7 @@
 .venv/
 
 Jarvis_V2/data/
+Jarvis_V2/temp_processing/
 
 __pycache__/
 *.pyc
