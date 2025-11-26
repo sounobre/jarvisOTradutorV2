@@ -23,7 +23,7 @@ from services.corpus_builder_service import (
     run_alignment_for_all_pending,
     run_corpus_validation,
     schedule_macro_map_for_all_pending, run_master_alignment_job,
-    run_master_validation_job  # <-- A NOVA "FUNÇÃO MESTRA"
+    run_master_validation_job, run_chapter_audit, run_master_chapter_audit_job  # <-- A NOVA "FUNÇÃO MESTRA"
 )
 
 router = APIRouter(prefix="/epub/corpus_v2", tags=["corpus-pipeline-v2"])
@@ -276,3 +276,35 @@ async def get_status_endpoint(
     except Exception as e:
         logger.exception(f"Erro ao buscar status: {e}") # Loga o erro completo no console
         raise HTTPException(status_code=500, detail=f"Erro ao buscar status: {e}")
+
+
+@router.post("/3b-audit-chapters")
+async def audit_chapters_endpoint(
+    req: JobRequest,
+    background_tasks: BackgroundTasks,
+):
+    """
+    Botão 3-B (Auditoria):
+    - Com ID: Audita o livro específico.
+    - Sem ID (vazio): Audita TODOS os livros que têm capítulos alinhados ('aligned').
+    """
+    try:
+        if req.import_id:
+            # MODO 1: Único
+            background_tasks.add_task(run_chapter_audit, req.import_id, True) # True = auto_fix
+            msg = f"Auditoria iniciada para import_id={req.import_id}."
+        else:
+            # MODO 2: Automático (Todos)
+            background_tasks.add_task(run_master_chapter_audit_job)
+            msg = "Job Mestre de Auditoria iniciado para TODOS os livros pendentes."
+
+        logger.info(f"Endpoint 3B: {msg}")
+        return {
+            "status": "audit_job_scheduled",
+            "import_id": req.import_id if req.import_id else "ALL",
+            "message": msg
+        }
+
+    except Exception as e:
+        logger.exception(f"Falha ao agendar auditoria: {e}")
+        raise HTTPException(status_code=500, detail=f"Erro: {e}")

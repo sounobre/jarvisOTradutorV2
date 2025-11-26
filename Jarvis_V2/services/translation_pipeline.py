@@ -1,6 +1,5 @@
 # --- ARQUIVO ATUALIZADO: services/translation_pipeline.py ---
-# ARQUITETURA: GGUF via llama-cpp-python
-# MODELO: Qwen 2.5 7B Instruct (Otimizado para Fantasia)
+# COM SISTEMA DE LOGS (TELEMETRIA)
 
 import logging
 import os
@@ -8,32 +7,35 @@ import re
 import shutil
 import zipfile
 import tempfile
+import time  # <-- Importante para cronometrar
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
 import asyncio
-import torch
 
-# Importamos o carregador GGUF
+# --- MOTOR: llama_cpp ---
 from llama_cpp import Llama
 from sqlalchemy.ext.asyncio import AsyncSession
-from transformers import AutoTokenizer
 
 from db.session import AsyncSessionLocal
-from sqlalchemy import select
+
+from sqlalchemy import select, insert
 from db import models
 
 logger = logging.getLogger(__name__)
 
-# --- Constantes do Modelo (Qwen 2.5) ---
-REPO_ID = "bartowski/Qwen2.5-7B-Instruct-GGUF"
-# Usamos Q5_K_M para um equilíbrio perfeito entre qualidade e velocidade na 3060
-MODEL_FILE = "Qwen2.5-7B-Instruct-Q5_K_M.gguf"
-
+# --- Constantes ---
+REPO_ID = "Qwen/Qwen2.5-7B-Instruct-GGUF"
+MODEL_FILE = "qwen2.5-7b-instruct-q5_k_m.gguf"
 HTML_TAG_REGEX = re.compile(r'(<[^>]+>)')
-MAX_CHUNK_SIZE = 1500  # Reduzi um pouco para dar margem ao Qwen raciocinar
+
+# Configurações de Geração (Salvas no Log)
+GEN_CTX = 4096
+GEN_TEMP = 0.3
+GEN_MAX_TOKENS = 2048
+MAX_CHUNK_SIZE = 1500
 
 
-# --- Funções de Preparação ---
+# --- Funções de Preparação (IGUAIS) ---
 
 async def _get_import_paths(session: AsyncSession, import_id: int) -> Optional[Tuple[Path, str]]:
     stmt = select(models.Import.file_en, models.Import.name).where(models.Import.id == import_id)
@@ -65,7 +67,6 @@ def _reconstitute_html(translated_text: str, placeholder_map: Dict[str, str]) ->
     if not placeholder_map:
         return translated_text
     for placeholder, original_tag in placeholder_map.items():
-        # Remove espaços extras que o modelo possa ter colocado em volta da tag
         translated_text = translated_text.replace(f" {placeholder}", placeholder)
         translated_text = translated_text.replace(f"{placeholder} ", placeholder)
         translated_text = translated_text.replace(placeholder, original_tag)
@@ -87,7 +88,6 @@ def _smart_chunking(text: str, max_chars: int) -> List[str]:
     chunks = []
     current_chunk = []
     current_length = 0
-
     for para in paragraphs:
         if len(para) > max_chars:
             if current_chunk:
@@ -96,7 +96,6 @@ def _smart_chunking(text: str, max_chars: int) -> List[str]:
                 current_length = 0
             chunks.append(para)
             continue
-
         if current_length + len(para) > max_chars:
             chunks.append("\n".join(current_chunk))
             current_chunk = [para]
@@ -104,46 +103,59 @@ def _smart_chunking(text: str, max_chars: int) -> List[str]:
         else:
             current_chunk.append(para)
             current_length += len(para) + 1
-
     if current_chunk:
         chunks.append("\n".join(current_chunk))
     return chunks
 
 
-async def _fetch_glossary_string(session: AsyncSession, import_id: int) -> str:
-    """
-    Busca o glossário no banco e formata como uma string de regras.
-    Retorna vazio se não houver glossário.
-    """
-    stmt = select(models.TmGlossary).where(models.TmGlossary.import_id == import_id)
-    terms = (await session.execute(stmt)).scalars().all()
+# --- NOVO HELPER: Salvar Log ---
+async def _log_translation_event(
+        session: AsyncSession,
+        import_id: int,
+        file_name: str,
+        chunk_idx: int,
+        source: str,
+        target: str,
+        prompt: str,
+        duration: float
+):
+    """Salva os metadados da tradução no banco para análise futura."""
+    try:
+        await session.execute(
+            insert(models.TmTranslationLog).values(
+                import_id=import_id,
+                file_name=file_name,
+                chunk_index=chunk_idx,
+                source_text=source,
+                translated_text=target,
+                model_name=REPO_ID,
+                prompt_snapshot=prompt,
+                temperature=GEN_TEMP,
+                duration_seconds=duration
+            )
+        )
+        # Não fazemos commit aqui para não desacelerar o loop principal demais,
+        # o commit acontece junto com o update do capítulo ou periodicamente.
+    except Exception as e:
+        logger.error(f"Falha ao salvar log de tradução: {e}")
 
-    if not terms:
-        return ""
 
-    # Formata para o LLM entender claramente
-    glossary_lines = ["GLOSSARY (Mandatory Terminology):"]
-    for term in terms:
-        glossary_lines.append(f"- '{term.term_source}' must be translated as '{term.term_target}'")
-
-    return "\n".join(glossary_lines)
-# --- O CORAÇÃO DO SERVIÇO (QWEN 2.5) ---
+# --- O CORAÇÃO DO SERVIÇO (QWEN 2.5 + TELEMETRIA) ---
 
 async def translate_epub_book(import_id: int):
-    logger.info(f"TRADUÇÃO GGUF INICIADA para import_id={import_id} (Modelo: Qwen 2.5 7B).")
+    logger.info(f"TRADUÇÃO GGUF INICIADA para import_id={import_id} (Modelo: {REPO_ID}).")
 
     temp_dir = None
 
     # 1. Carregar o Modelo
     try:
-        logger.info(f"Carregando Qwen 2.5 GGUF na GPU...")
-
+        logger.info(f"Carregando Modelo na GPU...")
         model = Llama.from_pretrained(
             repo_id=REPO_ID,
             filename=MODEL_FILE,
-            n_gpu_layers=-1,  # Tenta jogar tudo pra GPU (sua 3060 aguenta)
-            n_ctx=4096,  # Contexto suficiente para chunks de 1500 chars
-            verbose=True  # Mantenha True para ver o 'offloaded layers'
+            n_gpu_layers=-1,
+            n_ctx=GEN_CTX,
+            verbose=True
         )
         logger.info(f"Modelo carregado com sucesso na GPU!")
 
@@ -153,11 +165,6 @@ async def translate_epub_book(import_id: int):
 
     # 2. Lógica de Arquivos
     async with AsyncSessionLocal() as session:
-
-        glossary_instruction = await _fetch_glossary_string(session, import_id)
-        if glossary_instruction:
-            logger.info(f"Glossário encontrado e injetado com {glossary_instruction.count('-')} termos.")
-
         paths = await _get_import_paths(session, import_id)
         if not paths: return
         original_path, book_name = paths
@@ -189,37 +196,50 @@ async def translate_epub_book(import_id: int):
                     translated_chunks = []
 
                     for j, chunk in enumerate(text_chunks):
-                        # --- PROMPT ESPECIALIZADO PARA QWEN (ChatML) ---
-                        # O Qwen adora 'system prompts' detalhados.
+                        # --- PROMPT (Com Injeção de Glossário futuramente) ---
                         prompt = f"""<|im_start|>system
 You are a professional literary translator specializing in High Fantasy novels. 
 Translate the text below from English to Portuguese (Brazil).
 
 Guidelines:
 1. Maintain the tone, style, and atmosphere of the original text.
-2. Keep all formatting tags (like [TAG_0000]) EXACTLY where they are in the structure.
+2. Keep all formatting tags (like [TAG_0000]) EXACTLY where they are.
 3. Translate idioms and cultural references naturally for a Brazilian audience.
-4. Do NOT provide explanations, notes, or introductory text. Output ONLY the translation.
+4. Do NOT provide explanations. Output ONLY the translation.
 <|im_end|>
 <|im_start|>user
 {chunk}<|im_end|>
 <|im_start|>assistant
 """
 
-                        # Geração
+                        # --- GERAÇÃO COM TIMER ---
+                        start_time = time.time()
+
                         output = model(
                             prompt,
-                            max_tokens=2048,
-                            temperature=0.3,  # Um pouco mais de criatividade que o 0.1, bom para literatura
-                            stop=["<|im_end|>"],  # Parada correta do Qwen
+                            max_tokens=GEN_MAX_TOKENS,
+                            temperature=GEN_TEMP,
+                            stop=["<|im_end|>"],
                             echo=False
                         )
+
+                        end_time = time.time()
+                        duration = end_time - start_time
 
                         chunk_translation = output['choices'][0]['text'].strip()
                         translated_chunks.append(chunk_translation)
 
+                        # --- SALVA O LOG (Telemetria) ---
+                        await _log_translation_event(
+                            session, import_id, file_path.name, j,
+                            chunk, chunk_translation, prompt, duration
+                        )
+
                         if (j + 1) % 5 == 0:
-                            logger.info(f"  -> Chunk {j + 1}/{len(text_chunks)} traduzido.")
+                            logger.info(f"  -> Chunk {j + 1}/{len(text_chunks)} traduzido ({duration:.2f}s).")
+
+                    # Commit dos logs deste capítulo
+                    await session.commit()
 
                     full_translated_text = "\n".join(translated_chunks)
                     final_pt_html = _reconstitute_html(full_translated_text, placeholder_map)

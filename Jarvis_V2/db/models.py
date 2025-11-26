@@ -219,3 +219,77 @@ class TmTranslationLog(Base):
     __table_args__ = (
         Index("idx_trans_log_import", "import_id"),
     )
+
+
+class TmBulkImportLog(Base):
+    """
+    Tabela de Auditoria para o processo de Importação em Lote.
+    Guarda o sucesso ou erro de cada livro da planilha.
+    """
+    __tablename__ = "tm_bulk_import_log"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+
+    # Um ID único para identificar ESSA execução da planilha (batch_id)
+    batch_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+
+    # Dados da linha da planilha
+    row_index: Mapped[int] = mapped_column(Integer, nullable=False)  # Linha do Excel
+    book_title: Mapped[str] = mapped_column(Text, nullable=False)
+
+    # Status: 'SUCCESS', 'ERROR', 'WARNING', 'SKIPPED'
+    status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+
+    # A mensagem detalhada (ou o stack trace do erro)
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class TmMacroMapLog(Base):
+    """
+    Tabela de Auditoria para a Fase 1 (Mapeamento Macro).
+    Guarda o passo a passo do alinhamento de capítulos.
+    """
+    __tablename__ = "tm_macro_map_log"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+
+    import_id: Mapped[int] = mapped_column(ForeignKey("tm_import.id", ondelete="CASCADE"), nullable=False, index=True)
+
+    # Etapa do processo: 'FETCH', 'EMBEDDING', 'MATCHING', 'SAVING'
+    step: Mapped[str] = mapped_column(String(50), nullable=False)
+
+    # Status: 'INFO', 'SUCCESS', 'ERROR', 'WARNING'
+    status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+
+    # Detalhes
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class TmAlignmentLog(Base):
+    """
+    Tabela de Auditoria para a Fase 2 (Micro Alinhamento).
+    Rastreia o processamento individual de cada capítulo.
+    """
+    __tablename__ = "tm_alignment_log"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+
+    import_id: Mapped[int] = mapped_column(ForeignKey("tm_import.id", ondelete="CASCADE"), nullable=False, index=True)
+
+    # Qual capítulo estava sendo processado? (HREF)
+    ch_src: Mapped[str] = mapped_column(Text, nullable=False, index=True)
+
+    # Etapa: 'SEGMENTATION', 'SUBPROCESS', 'SAVING', 'FINISHED'
+    step: Mapped[str] = mapped_column(String(50), nullable=False)
+
+    # Status: 'INFO', 'SUCCESS', 'ERROR'
+    status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+
+    # Detalhes (ex: "Encontrados 150 pares", "Erro no Stanza: ...")
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
