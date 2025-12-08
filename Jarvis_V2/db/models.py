@@ -157,6 +157,10 @@ class TmAlignedSentences(Base):
 
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
+    cross_encoder_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    exported_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+
     __table_args__ = (
         UniqueConstraint("import_id", "ch_src", "source_text", "target_text", name="uq_aligned_pair"),
         Index("idx_aligned_import_status", "import_id", "validation_status"),  # Novo índice
