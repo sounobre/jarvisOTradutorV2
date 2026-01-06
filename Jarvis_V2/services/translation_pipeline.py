@@ -1,5 +1,5 @@
-# --- ARQUIVO ATUALIZADO: services/translation_pipeline.py ---
-# COM SISTEMA DE LOGS (TELEMETRIA)
+# --- ARQUIVO CORRIGIDO: services/translation_pipeline.py ---
+
 
 import logging
 import os
@@ -7,36 +7,26 @@ import re
 import shutil
 import zipfile
 import tempfile
-import time  # <-- Importante para cronometrar
+import time
 from pathlib import Path
-from typing import Dict, List, Any, Optional, Tuple
-import asyncio
+from typing import Dict, List, Optional, Tuple
 
-# --- MOTOR: llama_cpp ---
-from llama_cpp import Llama
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from db.session import AsyncSessionLocal
-
+import httpx
 from sqlalchemy import select, insert
+from sqlalchemy.ext.asyncio import AsyncSession
+from db.session import AsyncSessionLocal
 from db import models
 
 logger = logging.getLogger(__name__)
 
-# --- Constantes ---
-REPO_ID = "Qwen/Qwen2.5-7B-Instruct-GGUF"
-MODEL_FILE = "qwen2.5-7b-instruct-q5_k_m.gguf"
+# --- CONFIGURAÇÃO ---
+# Se o Jarvis estiver em outra porta, mude aqui (ex: 8001 se rodar junto)
+JARVIS_API_URL = "http://localhost:8001/translate"
+MAX_CHUNK_SIZE = 1500
 HTML_TAG_REGEX = re.compile(r'(<[^>]+>)')
 
-# Configurações de Geração (Salvas no Log)
-GEN_CTX = 4096
-GEN_TEMP = 0.3
-GEN_MAX_TOKENS = 2048
-MAX_CHUNK_SIZE = 1500
 
-
-# --- Funções de Preparação (IGUAIS) ---
-
+# --- Funções Auxiliares (Mantidas) ---
 async def _get_import_paths(session: AsyncSession, import_id: int) -> Optional[Tuple[Path, str]]:
     stmt = select(models.Import.file_en, models.Import.name).where(models.Import.id == import_id)
     result = await session.execute(stmt)
@@ -45,8 +35,7 @@ async def _get_import_paths(session: AsyncSession, import_id: int) -> Optional[T
 
 def _split_and_tokenize_html(html_chunk: str) -> Tuple[str, Dict[str, str]]:
     tags_list = HTML_TAG_REGEX.findall(html_chunk)
-    if not tags_list:
-        return html_chunk, {}
+    if not tags_list: return html_chunk, {}
     parts = HTML_TAG_REGEX.split(html_chunk)
     clean_text_parts = []
     placeholder_map = {}
@@ -59,13 +48,11 @@ def _split_and_tokenize_html(html_chunk: str) -> Tuple[str, Dict[str, str]]:
             tag_counter += 1
         else:
             clean_text_parts.append(part)
-    clean_text = "".join(clean_text_parts)
-    return clean_text, placeholder_map
+    return "".join(clean_text_parts), placeholder_map
 
 
 def _reconstitute_html(translated_text: str, placeholder_map: Dict[str, str]) -> str:
-    if not placeholder_map:
-        return translated_text
+    if not placeholder_map: return translated_text
     for placeholder, original_tag in placeholder_map.items():
         translated_text = translated_text.replace(f" {placeholder}", placeholder)
         translated_text = translated_text.replace(f"{placeholder} ", placeholder)
@@ -108,19 +95,11 @@ def _smart_chunking(text: str, max_chars: int) -> List[str]:
     return chunks
 
 
-# --- NOVO HELPER: Salvar Log ---
-async def _log_translation_event(
-        session: AsyncSession,
-        import_id: int,
-        file_name: str,
-        chunk_idx: int,
-        source: str,
-        target: str,
-        prompt: str,
-        duration: float
-):
-    """Salva os metadados da tradução no banco para análise futura."""
+async def _log_translation_event(session: AsyncSession, import_id: int, file_name: str, chunk_idx: int, source: str, target: str, duration: float):
     try:
+        # Prompt genérico para não quebrar o NOT NULL
+        dummy_prompt = "REMOTE_INFERENCE_API_CALL"
+
         await session.execute(
             insert(models.TmTranslationLog).values(
                 import_id=import_id,
@@ -128,140 +107,119 @@ async def _log_translation_event(
                 chunk_index=chunk_idx,
                 source_text=source,
                 translated_text=target,
-                model_name=REPO_ID,
-                prompt_snapshot=prompt,
-                temperature=GEN_TEMP,
+                model_name="Jarvis-LoRA-API",
+                prompt_snapshot=dummy_prompt,
+                temperature=0.1,  # <--- ADICIONE ESTA LINHA AQUI (Pode ser 0.1, 0.3, qualquer float)
                 duration_seconds=duration
             )
         )
-        # Não fazemos commit aqui para não desacelerar o loop principal demais,
-        # o commit acontece junto com o update do capítulo ou periodicamente.
     except Exception as e:
-        logger.error(f"Falha ao salvar log de tradução: {e}")
+        logger.error(f"Falha ao salvar log: {e}")
+        # Importante: Se der erro no log, não queremos travar a transação principal
+        # Mas como estamos na mesma session, o ideal é ignorar ou fazer rollback parcial se suportado.
+        # No asyncpg, um erro invalida a transação toda, então o try/except aqui é vital.
 
 
-# --- O CORAÇÃO DO SERVIÇO (QWEN 2.5 + TELEMETRIA) ---
+# --- PIPELINE PRINCIPAL ---
 
 async def translate_epub_book(import_id: int):
-    logger.info(f"TRADUÇÃO GGUF INICIADA para import_id={import_id} (Modelo: {REPO_ID}).")
-
+    logger.info(f"Iniciando Pipeline Jarvis (HTTP) para import_id={import_id}")
     temp_dir = None
 
-    # 1. Carregar o Modelo
-    try:
-        logger.info(f"Carregando Modelo na GPU...")
-        model = Llama.from_pretrained(
-            repo_id=REPO_ID,
-            filename=MODEL_FILE,
-            n_gpu_layers=-1,
-            n_ctx=GEN_CTX,
-            verbose=True
-        )
-        logger.info(f"Modelo carregado com sucesso na GPU!")
+    async with httpx.AsyncClient(timeout=None) as client:
 
-    except Exception as e:
-        logger.error(f"Falha ao carregar o modelo GGUF. Abortando. {e}")
-        return
-
-    # 2. Lógica de Arquivos
-    async with AsyncSessionLocal() as session:
-        paths = await _get_import_paths(session, import_id)
-        if not paths: return
-        original_path, book_name = paths
-        original_path = Path(original_path)
-        if not original_path.exists():
-            logger.error(f"Arquivo EPUB não encontrado: {original_path}")
-            return
-
+        # Teste de Conexão Rápido
         try:
-            temp_dir = Path(tempfile.mkdtemp())
-            with zipfile.ZipFile(original_path, 'r') as zip_ref:
-                zip_ref.extractall(temp_dir)
+            # Tenta bater na raiz ou docs só pra ver se está vivo
+            await client.get("http://localhost:8000/docs")
+        except Exception:
+            logger.warning(f"⚠️ AVISO: Não consegui contatar {JARVIS_API_URL}. O Jarvis está rodando? Vou tentar mesmo assim.")
 
-            logger.info(f"EPUB descompactado em: {temp_dir}")
-            content_files = list(temp_dir.rglob('*.xhtml')) + list(temp_dir.rglob('*.html'))
+        async with AsyncSessionLocal() as session:
+            try:
+                paths = await _get_import_paths(session, import_id)
+                if not paths: return
+                original_path, book_name = paths
+                original_path = Path(original_path)
 
-            # 3. Loop de Tradução
-            for i, file_path in enumerate(content_files):
-                try:
-                    raw_html = file_path.read_text(encoding='utf-8')
-                    clean_text, placeholder_map = _split_and_tokenize_html(raw_html)
+                if not original_path.exists():
+                    logger.error(f"Arquivo não encontrado: {original_path}")
+                    return
 
-                    if len(clean_text.strip()) < 5:
+                temp_dir = Path(tempfile.mkdtemp())
+                with zipfile.ZipFile(original_path, 'r') as zip_ref:
+                    zip_ref.extractall(temp_dir)
+
+                content_files = list(temp_dir.rglob('*.xhtml')) + list(temp_dir.rglob('*.html'))
+                content_files.sort()  # Garante ordem
+
+                logger.info(f"Arquivos para traduzir: {len(content_files)}")
+
+                for i, file_path in enumerate(content_files):
+                    try:
+                        raw_html = file_path.read_text(encoding='utf-8')
+                        clean_text, placeholder_map = _split_and_tokenize_html(raw_html)
+
+                        if len(clean_text.strip()) < 5: continue
+
+                        text_chunks = _smart_chunking(clean_text, MAX_CHUNK_SIZE)
+                        translated_chunks = []
+
+                        logger.info(f"Traduzindo {file_path.name} ({len(text_chunks)} partes)...")
+
+                        for j, chunk in enumerate(text_chunks):
+                            start_time = time.time()
+                            translated_text = ""
+
+                            try:
+                                # Chama a API
+                                response = await client.post(
+                                    JARVIS_API_URL,
+                                    json={"text": chunk}
+                                )
+
+                                if response.status_code == 200:
+                                    translated_text = response.json().get("translation", "")
+                                else:
+                                    logger.error(f"Erro API Jarvis ({response.status_code}): {response.text}")
+                                    translated_text = chunk  # Fallback
+
+                            except Exception as e:
+                                logger.error(f"Erro conexão API (Chunk {j}): {e}")
+                                translated_text = chunk
+
+                            duration = time.time() - start_time
+                            translated_chunks.append(translated_text)
+
+                            # Loga no banco (Agora protegido contra erro de Null)
+                            await _log_translation_event(
+                                session, import_id, file_path.name, j,
+                                chunk, translated_text, duration
+                            )
+
+                        # Commit por arquivo para salvar progresso
+                        await session.commit()
+
+                        full_text = "\n".join(translated_chunks)
+                        final_html = _reconstitute_html(full_text, placeholder_map)
+                        file_path.write_text(final_html, encoding='utf-8')
+
+                    except Exception as e:
+                        logger.error(f"Erro no arquivo {file_path.name}: {e}")
+                        await session.rollback()  # CORREÇÃO 2: Limpa a transação se der erro
                         continue
 
-                    logger.info(f"Processando {file_path.name} ({len(clean_text)} chars)...")
+                # Finalização
+                output_dir = Path("data/translated")
+                output_dir.mkdir(exist_ok=True, parents=True)
+                final_epub_name = f"{book_name}_PT_JARVIS.epub"
+                output_path = output_dir / final_epub_name
 
-                    text_chunks = _smart_chunking(clean_text, MAX_CHUNK_SIZE)
-                    translated_chunks = []
+                _create_output_epub(temp_dir, output_path)
+                logger.info(f"✅ SUCESSO! Livro salvo em: {output_path}")
 
-                    for j, chunk in enumerate(text_chunks):
-                        # --- PROMPT (Com Injeção de Glossário futuramente) ---
-                        prompt = f"""<|im_start|>system
-You are a professional literary translator specializing in High Fantasy novels. 
-Translate the text below from English to Portuguese (Brazil).
-
-Guidelines:
-1. Maintain the tone, style, and atmosphere of the original text.
-2. Keep all formatting tags (like [TAG_0000]) EXACTLY where they are.
-3. Translate idioms and cultural references naturally for a Brazilian audience.
-4. Do NOT provide explanations. Output ONLY the translation.
-<|im_end|>
-<|im_start|>user
-{chunk}<|im_end|>
-<|im_start|>assistant
-"""
-
-                        # --- GERAÇÃO COM TIMER ---
-                        start_time = time.time()
-
-                        output = model(
-                            prompt,
-                            max_tokens=GEN_MAX_TOKENS,
-                            temperature=GEN_TEMP,
-                            stop=["<|im_end|>"],
-                            echo=False
-                        )
-
-                        end_time = time.time()
-                        duration = end_time - start_time
-
-                        chunk_translation = output['choices'][0]['text'].strip()
-                        translated_chunks.append(chunk_translation)
-
-                        # --- SALVA O LOG (Telemetria) ---
-                        await _log_translation_event(
-                            session, import_id, file_path.name, j,
-                            chunk, chunk_translation, prompt, duration
-                        )
-
-                        if (j + 1) % 5 == 0:
-                            logger.info(f"  -> Chunk {j + 1}/{len(text_chunks)} traduzido ({duration:.2f}s).")
-
-                    # Commit dos logs deste capítulo
-                    await session.commit()
-
-                    full_translated_text = "\n".join(translated_chunks)
-                    final_pt_html = _reconstitute_html(full_translated_text, placeholder_map)
-
-                    file_path.write_text(final_pt_html, encoding='utf-8')
-                    logger.info(f"[{i + 1}/{len(content_files)}] Arquivo concluído: {file_path.name}")
-
-                except Exception as e:
-                    logger.error(f"Erro no arquivo {file_path.name}: {e}")
-                    continue
-
-                    # 4. Recompactação
-            output_dir = Path("data/translated")
-            output_dir.mkdir(exist_ok=True)
-            final_epub_name = f"{book_name}_PT_QWEN.epub"
-            output_path = output_dir / final_epub_name
-
-            _create_output_epub(temp_dir, output_path)
-            logger.info(f"SUCESSO! EPUB FINAL: {output_path}")
-
-        except Exception as e:
-            logger.exception(f"Erro no pipeline: {e}")
-        finally:
-            if temp_dir and temp_dir.exists():
-                shutil.rmtree(temp_dir)
+            except Exception as e:
+                logger.exception(f"Erro fatal: {e}")
+            finally:
+                if temp_dir and temp_dir.exists():
+                    shutil.rmtree(temp_dir)
